@@ -43,12 +43,12 @@ import java.util.stream.Stream;
 import static org.jackhuang.hmcl.util.i18n.I18n.i18n;
 import static org.jackhuang.hmcl.util.Lang.toIterable;
 
-/// Extracts a manually packaged `.minecraft` archive into an external game directory.
+/// Extracts a manually packaged Minecraft game directory into an external game directory.
 @NotNullByDefault
 public class ManuallyCreatedModpackInstallTask extends Task<Path> {
 
-    /// Game-directory entries that indicate a version-isolated running directory.
-    private static final @Unmodifiable Set<String> VERSION_DIRECTORY_MARKERS = Set.of(
+    /// Entries that identify a directory as containing Minecraft runtime data.
+    private static final @Unmodifiable Set<String> GAME_DIRECTORY_MARKERS = Set.of(
             "mods",
             "config",
             "defaultconfigs",
@@ -114,9 +114,9 @@ public class ManuallyCreatedModpackInstallTask extends Task<Path> {
         setResult(dest);
     }
 
-    /// Detects the fixed running-directory layout for each valid version in a `.minecraft` directory.
+    /// Detects the fixed running-directory layout for each valid version in a Minecraft directory.
     ///
-    /// @param minecraftDirectory the archive's `.minecraft` directory
+    /// @param minecraftDirectory the archive's Minecraft directory
     /// @return an immutable map from version ID to its detected isolation mode
     @VisibleForTesting
     static @Unmodifiable Map<String, HMCLGameRepository.LockedVersionIsolation> detectVersionIsolation(Path minecraftDirectory) throws IOException {
@@ -141,9 +141,7 @@ public class ManuallyCreatedModpackInstallTask extends Task<Path> {
                 @Nullable HMCLGameRepository.LockedVersionIsolation detected =
                         readConfiguredIsolation(versionDirectory);
                 if (detected == null) {
-                    detected = hasVersionDirectoryContent(versionDirectory)
-                            ? HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER
-                            : HMCLGameRepository.LockedVersionIsolation.ROOT_FOLDER;
+                    detected = detectIsolationFromPhysicalLayout(minecraftDirectory, versionDirectory);
                 }
                 result.put(version, detected);
             }
@@ -163,9 +161,14 @@ public class ManuallyCreatedModpackInstallTask extends Task<Path> {
         if (Files.isRegularFile(instanceSettings)) {
             try {
                 @Nullable JsonObject settings = JsonUtils.fromJsonFile(instanceSettings, JsonObject.class);
-                if (settings != null && hasRunningDirectoryOverride(settings)
-                        && StringUtils.isBlank(JsonUtils.getString(settings, GameSettings.PROPERTY_RUNNING_DIRECTORY, ""))) {
-                    return HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER;
+                if (settings != null) {
+                    if (!hasRunningDirectoryOverride(settings)) {
+                        return HMCLGameRepository.LockedVersionIsolation.ROOT_FOLDER;
+                    }
+                    if (StringUtils.isBlank(JsonUtils.getString(
+                            settings, GameSettings.PROPERTY_RUNNING_DIRECTORY, ""))) {
+                        return HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER;
+                    }
                 }
             } catch (IOException | RuntimeException ignored) {
                 // Fall back to the physical layout when the embedded settings are malformed.
@@ -203,10 +206,33 @@ public class ManuallyCreatedModpackInstallTask extends Task<Path> {
         return null;
     }
 
-    /// Returns whether a version directory contains files characteristic of an isolated game directory.
-    private static boolean hasVersionDirectoryContent(Path versionDirectory) {
-        for (String marker : VERSION_DIRECTORY_MARKERS) {
-            if (Files.exists(versionDirectory.resolve(marker))) {
+    /// Infers isolation from the locations of Minecraft runtime data.
+    ///
+    /// Version-only data proves isolation and root-only data proves a shared running directory. If
+    /// both locations contain data, version-local data wins so the imported instance keeps using its
+    /// own mods and configuration. If neither location contains data, the conventional shared root
+    /// is used. Explicit HMCL metadata is evaluated before this fallback.
+    private static HMCLGameRepository.LockedVersionIsolation detectIsolationFromPhysicalLayout(
+            Path minecraftDirectory,
+            Path versionDirectory) {
+        boolean hasRootContent = hasGameDirectoryContent(minecraftDirectory);
+        boolean hasVersionContent = hasGameDirectoryContent(versionDirectory);
+        if (hasVersionContent && !hasRootContent) {
+            return HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER;
+        }
+        if (hasRootContent && !hasVersionContent) {
+            return HMCLGameRepository.LockedVersionIsolation.ROOT_FOLDER;
+        }
+
+        return hasVersionContent
+                ? HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER
+                : HMCLGameRepository.LockedVersionIsolation.ROOT_FOLDER;
+    }
+
+    /// Returns whether a directory contains files characteristic of a Minecraft running directory.
+    private static boolean hasGameDirectoryContent(Path directory) {
+        for (String marker : GAME_DIRECTORY_MARKERS) {
+            if (Files.exists(directory.resolve(marker))) {
                 return true;
             }
         }

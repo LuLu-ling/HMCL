@@ -48,6 +48,7 @@ import org.jackhuang.hmcl.util.io.CompressingUtils;
 import org.jackhuang.hmcl.util.io.FileUtils;
 import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.Unmodifiable;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -63,12 +64,15 @@ import java.util.Optional;
 import java.util.stream.Stream;
 
 import static org.jackhuang.hmcl.util.Lang.mapOf;
-import static org.jackhuang.hmcl.util.Lang.toIterable;
 import static org.jackhuang.hmcl.util.Pair.pair;
 
 /// Utilities for reading, installing, and applying modpack-specific game settings.
 @NotNullByDefault
 public final class ModpackHelper {
+    /// Maximum nesting depth inspected when locating a manually archived Minecraft directory.
+    private static final int MINECRAFT_DIRECTORY_SEARCH_DEPTH = 2;
+
+    /// Prevents instantiation.
     private ModpackHelper() {
     }
 
@@ -124,28 +128,54 @@ public final class ModpackHelper {
         throw new UnsupportedModpackException(file.toString());
     }
 
+    /// Finds the Minecraft directory inside an archive created directly from a game directory.
+    ///
+    /// A candidate must contain at least one `versions/<id>/<id>.json` entry. An explicitly named
+    /// `.minecraft` candidate takes precedence; otherwise the candidate must be unique so that an
+    /// unrelated launcher directory is never selected arbitrarily.
+    ///
+    /// @param modpackName the source name used when reporting an unsupported archive
+    /// @param fs the mounted archive file system
+    /// @return the unambiguous Minecraft directory in the archive
+    /// @throws IOException if the archive directory tree cannot be read
+    /// @throws UnsupportedModpackException if no unambiguous Minecraft directory is present
     public static Path findMinecraftDirectoryInManuallyCreatedModpack(String modpackName, FileSystem fs) throws IOException, UnsupportedModpackException {
         Path root = fs.getPath("/");
-        if (isMinecraftDirectory(root)) return root;
-        try (Stream<Path> firstLayer = Files.list(root)) {
-            for (Path dir : toIterable(firstLayer)) {
-                if (isMinecraftDirectory(dir)) return dir;
-
-                try (Stream<Path> secondLayer = Files.list(dir)) {
-                    for (Path subdir : toIterable(secondLayer)) {
-                        if (isMinecraftDirectory(subdir)) return subdir;
-                    }
-                } catch (IOException ignored) {
-                }
-            }
-        } catch (IOException ignored) {
+        @Unmodifiable List<Path> candidates;
+        try (Stream<Path> paths = Files.walk(root, MINECRAFT_DIRECTORY_SEARCH_DEPTH)) {
+            candidates = paths.filter(ModpackHelper::isMinecraftDirectory).toList();
         }
+
+        @Unmodifiable List<Path> explicitlyNamedCandidates = candidates.stream()
+                .filter(path -> ".minecraft".equals(FileUtils.getName(path)))
+                .toList();
+        if (explicitlyNamedCandidates.size() == 1) {
+            return explicitlyNamedCandidates.get(0);
+        }
+        if (explicitlyNamedCandidates.isEmpty() && candidates.size() == 1) {
+            return candidates.get(0);
+        }
+
         throw new UnsupportedModpackException(modpackName);
     }
 
+    /// Returns whether a directory contains at least one structurally valid Minecraft version.
     private static boolean isMinecraftDirectory(Path path) {
-        return Files.isDirectory(path.resolve("versions")) &&
-                (path.getFileName() == null || ".minecraft".equals(FileUtils.getName(path)));
+        Path versionsDirectory = path.resolve("versions");
+        if (!Files.isDirectory(versionsDirectory)) {
+            return false;
+        }
+
+        try (Stream<Path> versions = Files.list(versionsDirectory)) {
+            return versions.anyMatch(versionDirectory -> {
+                @Nullable Path versionName = versionDirectory.getFileName();
+                return Files.isDirectory(versionDirectory)
+                        && versionName != null
+                        && Files.isRegularFile(versionDirectory.resolve(versionName + ".json"));
+            });
+        } catch (IOException ignored) {
+            return false;
+        }
     }
 
     public static ModpackConfiguration<?> readModpackConfiguration(Path file) throws IOException {
