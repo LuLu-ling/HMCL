@@ -1686,17 +1686,18 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
         final Holder<Boolean> updating = new Holder<>(false);
 
         InvalidationListener refresh = observable -> {
-            S setting = currentSetting.get();
+            @Nullable S setting = currentSetting.get();
             if (!(setting instanceof GameSettings.Instance instance) || updating.value) {
                 return;
             }
 
             updating.value = true;
             try {
-                boolean forceIsolated = isCurrentInstanceModpack();
-                button.setSelected(forceIsolated
-                        || instance.getOverrideProperties().contains(GameSettings.PROPERTY_RUNNING_DIRECTORY));
-                button.setDisable(forceIsolated);
+                @Nullable Boolean lockedIsolation = getCurrentInstanceVersionIsolationLock();
+                button.setSelected(lockedIsolation != null
+                        ? lockedIsolation
+                        : instance.getOverrideProperties().contains(GameSettings.PROPERTY_RUNNING_DIRECTORY));
+                button.setDisable(lockedIsolation != null);
             } finally {
                 updating.value = false;
             }
@@ -1704,8 +1705,10 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
         InvalidationListener weakRefresh = holder.weak(refresh);
 
         button.selectedProperty().addListener((observable, oldValue, newValue) -> {
-            S setting = currentSetting.get();
-            if (!(setting instanceof GameSettings.Instance instance) || updating.value || isCurrentInstanceModpack()) {
+            @Nullable S setting = currentSetting.get();
+            if (!(setting instanceof GameSettings.Instance instance)
+                    || updating.value
+                    || getCurrentInstanceVersionIsolationLock() != null) {
                 return;
             }
 
@@ -1734,7 +1737,7 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
             refresh.invalidated(newValue);
         });
 
-        S setting = currentSetting.get();
+        @Nullable S setting = currentSetting.get();
         if (setting instanceof GameSettings.Instance instance) {
             instance.addListener(weakRefresh);
             refresh.invalidated(setting);
@@ -1758,7 +1761,7 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
         line.setTitleTrailing(inheritButton);
 
         InvalidationListener refresh = observable -> {
-            GameSettings setting = currentSetting.get();
+            @Nullable GameSettings setting = currentSetting.get();
             updateParentInheritablePropertyListener(setting, activeParentProperty, GameSettings::runningDirectoryProperty, refreshHolder.value);
             if (!(setting instanceof GameSettings.Instance instance) || updating.value) {
                 return;
@@ -1766,23 +1769,23 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
 
             updating.value = true;
             try {
-                boolean currentInstanceModpack = isCurrentInstanceModpack();
-                boolean useInstanceRunningDirectory = !currentInstanceModpack
+                @Nullable Boolean lockedIsolation = getCurrentInstanceVersionIsolationLock();
+                boolean useInstanceRunningDirectory = lockedIsolation == null
                         && instance.getOverrideProperties().contains(GameSettings.PROPERTY_RUNNING_DIRECTORY);
                 String runningDirectory;
-                if (currentInstanceModpack) {
-                    runningDirectory = getCurrentInstanceVersionRoot();
+                if (lockedIsolation != null) {
+                    runningDirectory = getCurrentLockedRunningDirectory(lockedIsolation);
                 } else if (useInstanceRunningDirectory) {
-                    String value = instance.runningDirectoryProperty().getValue();
+                    @Nullable String value = instance.runningDirectoryProperty().getValue();
                     runningDirectory = value != null ? value : instance.runningDirectoryProperty().defaultValue();
                 } else {
                     runningDirectory = getParentValue(instance, GameSettings::runningDirectoryProperty);
                 }
 
                 textProperty.setValue(runningDirectory);
-                editor.setDisable(currentInstanceModpack || !useInstanceRunningDirectory);
+                editor.setDisable(lockedIsolation != null || !useInstanceRunningDirectory);
                 updateInheritanceButton(inheritButton, !useInstanceRunningDirectory);
-                inheritButton.setDisable(currentInstanceModpack);
+                inheritButton.setDisable(lockedIsolation != null);
             } finally {
                 updating.value = false;
             }
@@ -1792,8 +1795,10 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
         activeParentSetting.addListener(weakRefresh);
 
         inheritButton.addEventFilter(MouseEvent.MOUSE_CLICKED, event -> {
-            GameSettings setting = currentSetting.get();
-            if (!(setting instanceof GameSettings.Instance instance) || updating.value || isCurrentInstanceModpack()) {
+            @Nullable GameSettings setting = currentSetting.get();
+            if (!(setting instanceof GameSettings.Instance instance)
+                    || updating.value
+                    || getCurrentInstanceVersionIsolationLock() != null) {
                 return;
             }
 
@@ -1813,10 +1818,10 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
         });
 
         textProperty.addListener((observable, oldValue, newValue) -> {
-            GameSettings setting = currentSetting.get();
+            @Nullable GameSettings setting = currentSetting.get();
             if (!(setting instanceof GameSettings.Instance instance)
                     || updating.value
-                    || isCurrentInstanceModpack()
+                    || getCurrentInstanceVersionIsolationLock() != null
                     || !instance.getOverrideProperties().contains(GameSettings.PROPERTY_RUNNING_DIRECTORY)) {
                 return;
             }
@@ -1841,24 +1846,37 @@ public final class GameSettingsPage<S extends GameSettings> extends StackPane
             refresh.invalidated(newValue);
         });
 
-        S setting = currentSetting.get();
+        @Nullable S setting = currentSetting.get();
         if (setting instanceof GameSettings.Instance instance) {
             instance.addListener(weakRefresh);
             refresh.invalidated(setting);
         }
     }
 
-    private boolean isCurrentInstanceModpack() {
-        return repository != null && instanceId != null && repository.isModpack(instanceId);
+    /// Returns the fixed isolation choice for the current instance.
+    ///
+    /// Formal modpacks are always isolated. Manually packaged instances use the layout detected
+    /// during import. Other instances return `null` and remain editable.
+    private @Nullable Boolean getCurrentInstanceVersionIsolationLock() {
+        if (repository == null || instanceId == null) {
+            return null;
+        }
+
+        @Nullable HMCLGameRepository.LockedVersionIsolation isolation =
+                repository.getVersionIsolationLock(instanceId);
+        if (isolation != null) {
+            return isolation == HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER;
+        }
+        return repository.isModpack(instanceId) ? true : null;
     }
 
-    /// Returns the current instance version root displayed for modpack running directories.
-    private String getCurrentInstanceVersionRoot() {
+    /// Returns the fixed running directory displayed for an imported or formal modpack instance.
+    private String getCurrentLockedRunningDirectory(boolean isolated) {
         if (repository == null || instanceId == null) {
             return "";
         }
 
-        return repository.getVersionRoot(instanceId).toString();
+        return (isolated ? repository.getVersionRoot(instanceId) : repository.getBaseDirectory()).toString();
     }
 
     /// Keeps a listener attached to the current instance's parent preset property.

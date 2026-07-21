@@ -657,6 +657,69 @@ public final class GameDirectoriesTest {
         }
     }
 
+    /// Tests that imported isolation locks override contradictory instance running-directory settings.
+    @Test
+    public void importedIsolationLocksControlRunDirectories(@TempDir Path tempDirectory)
+            throws IOException, ReflectiveOperationException {
+        GameSettingsPresetID defaultPresetId =
+                GameSettingsPresetID.parse("game-settings-preset:123e4567-e89b-12d3-a456-426614174000");
+        GameSettingsPresets presets = new GameSettingsPresets();
+        presets.getPresets().add(new GameSettings.Preset(defaultPresetId));
+
+        GameDirectory isolatedDirectory = new GameDirectory(
+                GameDirectoryID.generate(),
+                LocalizedText.plain("Isolated"),
+                PortablePath.of(tempDirectory.resolve("isolated").toString()));
+        GameDirectory sharedDirectory = new GameDirectory(
+                GameDirectoryID.generate(),
+                LocalizedText.plain("Shared"),
+                PortablePath.of(tempDirectory.resolve("shared").toString()));
+        GameDirectories localDirectories = new GameDirectories();
+        localDirectories.getGameDirectories().addAll(isolatedDirectory, sharedDirectory);
+        GameDirectories userDirectories = new GameDirectories();
+
+        try (GameDirectoryEnvironment ignored =
+                     new GameDirectoryEnvironment(localDirectories, userDirectories, presets)) {
+            settings().defaultGameSettingsPresetProperty().set(defaultPresetId);
+
+            HMCLGameRepository isolatedRepository = new HMCLGameRepository(isolatedDirectory);
+            writeVersionJson(isolatedRepository, "isolated");
+            HMCLGameRepository.writeVersionIsolationLock(
+                    isolatedRepository.getVersionRoot("isolated"),
+                    HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER);
+            isolatedRepository.refreshVersions();
+
+            assertEquals(
+                    HMCLGameRepository.LockedVersionIsolation.VERSION_FOLDER,
+                    isolatedRepository.getVersionIsolationLock("isolated"));
+            assertEquals(
+                    isolatedRepository.getVersionRoot("isolated"),
+                    isolatedRepository.getRunDirectory("isolated"));
+
+            HMCLGameRepository sharedRepository = new HMCLGameRepository(sharedDirectory);
+            writeVersionJson(sharedRepository, "shared");
+            Path sharedSettings = sharedRepository.getInstanceConfigDirectory("shared")
+                    .resolve(LegacyGameSettingsMigrator.INSTANCE_GAME_SETTINGS_FILENAME);
+            Files.createDirectories(Objects.requireNonNull(sharedSettings.getParent()));
+            Files.writeString(sharedSettings, """
+                    {
+                      "$schema": "https://schemas.glavo.site/hmcl/instance-game-settings/1.0.0",
+                      "overrideProperties": ["runningDirectory"],
+                      "runningDirectory": ""
+                    }
+                    """);
+            HMCLGameRepository.writeVersionIsolationLock(
+                    sharedRepository.getVersionRoot("shared"),
+                    HMCLGameRepository.LockedVersionIsolation.ROOT_FOLDER);
+            sharedRepository.refreshVersions();
+
+            assertEquals(
+                    HMCLGameRepository.LockedVersionIsolation.ROOT_FOLDER,
+                    sharedRepository.getVersionIsolationLock("shared"));
+            assertEquals(sharedRepository.getBaseDirectory(), sharedRepository.getRunDirectory("shared"));
+        }
+    }
+
     /// Temporary static state override for game directory tests.
     private static final class GameDirectoryEnvironment implements AutoCloseable {
         /// The reflected SettingsManager local game directories field.

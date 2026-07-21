@@ -84,6 +84,16 @@ public final class HMCLGameRepository extends DefaultGameRepository {
     public record InstanceReference(HMCLGameRepository repository, @Nullable String instanceId) {
     }
 
+    /// Fixed running-directory layouts used by manually packaged `.minecraft` imports.
+    @NotNullByDefault
+    public enum LockedVersionIsolation {
+        /// Use the game repository root as the running directory.
+        ROOT_FOLDER,
+
+        /// Use the version root as the running directory.
+        VERSION_FOLDER
+    }
+
     /// Directory under the version root that stores HMCL-managed instance metadata.
     private static final String INSTANCE_METADATA_DIRECTORY = ".hmcl";
 
@@ -95,6 +105,9 @@ public final class HMCLGameRepository extends DefaultGameRepository {
 
     /// Current file name for instance-specific game settings.
     private static final String INSTANCE_GAME_SETTINGS_FILENAME = "instance-game-settings.json";
+
+    /// State file that fixes the running-directory layout detected during manual modpack import.
+    private static final String VERSION_ISOLATION_LOCK_FILENAME = "version-isolation.lock";
 
     /// The persistent game directory for this repository.
     private final GameDirectory gameDirectory;
@@ -108,6 +121,9 @@ public final class HMCLGameRepository extends DefaultGameRepository {
     private final Set<String> loadedInstanceGameSettings = new HashSet<>();
     private final Set<String> readOnlyInstanceGameSettings = new HashSet<>();
     private final Set<String> beingModpackVersions = new HashSet<>();
+
+    /// Fixed version isolation modes loaded from HMCL-managed instance state.
+    private final Map<String, LockedVersionIsolation> versionIsolationLocks = new HashMap<>();
 
     public final EventManager<Event> onVersionIconChanged = new EventManager<>();
 
@@ -161,13 +177,21 @@ public final class HMCLGameRepository extends DefaultGameRepository {
         return new DefaultDependencyManager(this, downloadProvider, HMCLCacheRepository.REPOSITORY);
     }
 
+    /// Returns the effective running directory for an instance.
     @Override
     public Path getRunDirectory(String id) {
+        @Nullable LockedVersionIsolation lockedIsolation = versionIsolationLocks.get(id);
+        if (lockedIsolation != null) {
+            return lockedIsolation == LockedVersionIsolation.VERSION_FOLDER
+                    ? getVersionRoot(id)
+                    : getBaseDirectory();
+        }
+
         if (beingModpackVersions.contains(id) || isModpack(id)) {
             return getVersionRoot(id);
         }
 
-        GameSettings.Instance localSetting = getInstanceGameSettings(id);
+        @Nullable GameSettings.Instance localSetting = getInstanceGameSettings(id);
         boolean useInstanceRunningDirectory =
                 localSetting != null && localSetting.getOverrideProperties().contains(GameSettings.PROPERTY_RUNNING_DIRECTORY);
 
@@ -208,13 +232,18 @@ public final class HMCLGameRepository extends DefaultGameRepository {
                         .thenComparing(v -> VersionNumber.asVersion(v.getId())));
     }
 
+    /// Reloads versions together with their instance settings and isolation locks.
     @Override
     protected void refreshVersionsImpl() {
         instanceGameSettings.clear();
         loadedInstanceGameSettings.clear();
         readOnlyInstanceGameSettings.clear();
+        versionIsolationLocks.clear();
         super.refreshVersionsImpl();
-        versions.keySet().forEach(this::loadInstanceGameSettings);
+        versions.keySet().forEach(id -> {
+            loadInstanceGameSettings(id);
+            loadVersionIsolationLock(id);
+        });
 
         try {
             Path file = getBaseDirectory().resolve("launcher_profiles.json");
@@ -242,7 +271,7 @@ public final class HMCLGameRepository extends DefaultGameRepository {
         clean(getRunDirectory(id));
     }
 
-    /// Removes a version from disk and drops any cached instance settings for that version.
+    /// Removes a version from disk and drops its cached settings and isolation state.
     @Override
     public boolean removeVersionFromDisk(String id) {
         boolean removed = super.removeVersionFromDisk(id);
@@ -251,10 +280,17 @@ public final class HMCLGameRepository extends DefaultGameRepository {
             loadedInstanceGameSettings.remove(id);
             readOnlyInstanceGameSettings.remove(id);
             beingModpackVersions.remove(id);
+            versionIsolationLocks.remove(id);
         }
         return removed;
     }
 
+    /// Duplicates an instance and isolates the duplicate's copied running directory.
+    ///
+    /// @param srcId the source instance ID
+    /// @param dstId the destination instance ID
+    /// @param copySaves whether saved worlds should be copied
+    /// @throws IOException if instance files cannot be copied or rewritten
     public void duplicateVersion(String srcId, String dstId, boolean copySaves) throws IOException {
         Path srcDir = getVersionRoot(srcId);
         Path dstDir = getVersionRoot(dstId);
@@ -299,6 +335,11 @@ public final class HMCLGameRepository extends DefaultGameRepository {
         initInstanceGameSettings(dstId, newGameSettings);
         saveGameSettings(dstId);
 
+        if (versionIsolationLocks.containsKey(srcId)) {
+            writeVersionIsolationLock(dstDir, LockedVersionIsolation.VERSION_FOLDER);
+            versionIsolationLocks.put(dstId, LockedVersionIsolation.VERSION_FOLDER);
+        }
+
         Path dstGameDir = getRunDirectory(dstId);
 
         if (copyOriginalGameDir)
@@ -331,6 +372,58 @@ public final class HMCLGameRepository extends DefaultGameRepository {
     /// Returns the HMCL-managed state directory under the instance metadata directory.
     public Path getInstanceStateDirectory(String id) {
         return getInstanceMetadataDirectory(id).resolve(INSTANCE_STATE_DIRECTORY);
+    }
+
+    /// Returns the fixed version isolation mode for an imported instance.
+    ///
+    /// @param id the instance ID
+    /// @return the fixed isolation mode, or `null` when the setting remains editable
+    public @Nullable LockedVersionIsolation getVersionIsolationLock(String id) {
+        return versionIsolationLocks.get(id);
+    }
+
+    /// Reads a fixed version isolation mode from an instance version root.
+    ///
+    /// @param versionRoot the instance version root
+    /// @return the stored isolation mode, or `null` when no valid lock exists
+    static @Nullable LockedVersionIsolation readVersionIsolationLock(Path versionRoot) {
+        Path file = getVersionIsolationLockFile(versionRoot);
+        if (!Files.isRegularFile(file)) {
+            return null;
+        }
+
+        try {
+            return LockedVersionIsolation.valueOf(Files.readString(file).strip());
+        } catch (IOException | IllegalArgumentException e) {
+            LOG.warning("Failed to read version isolation lock " + file, e);
+            return null;
+        }
+    }
+
+    /// Writes a fixed version isolation mode under an instance version root.
+    ///
+    /// @param versionRoot the instance version root
+    /// @param isolation the isolation mode to store
+    /// @throws IOException if the lock file cannot be written
+    public static void writeVersionIsolationLock(Path versionRoot, LockedVersionIsolation isolation) throws IOException {
+        Path file = getVersionIsolationLockFile(versionRoot);
+        Files.createDirectories(Objects.requireNonNull(file.getParent()));
+        FileUtils.saveSafely(file, isolation.name() + "\n");
+    }
+
+    /// Returns the state-file path used to persist a fixed version isolation mode.
+    private static Path getVersionIsolationLockFile(Path versionRoot) {
+        return versionRoot.resolve(INSTANCE_METADATA_DIRECTORY)
+                .resolve(INSTANCE_STATE_DIRECTORY)
+                .resolve(VERSION_ISOLATION_LOCK_FILENAME);
+    }
+
+    /// Loads a fixed version isolation mode for an instance when present.
+    private void loadVersionIsolationLock(String id) {
+        @Nullable LockedVersionIsolation isolation = readVersionIsolationLock(getVersionRoot(id));
+        if (isolation != null) {
+            versionIsolationLocks.put(id, isolation);
+        }
     }
 
     /// Returns the current local game settings path under the instance configuration directory.
